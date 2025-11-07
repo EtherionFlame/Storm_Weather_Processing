@@ -1,0 +1,23 @@
+Ignore Python virtual environments
+
+venv/
+*.pyc
+pycache/
+
+Ignore IDE settings
+
+.idea/
+
+--- CRITICAL: Ignore all data! ---
+
+Ignore the raw downloaded 600GB+ dataset
+
+RawSEVIRData/
+
+Ignore the final processed .npy files
+
+ProcessedData/
+
+Ignore the catalog file (it's data, not code)
+
+CATALOG.csv

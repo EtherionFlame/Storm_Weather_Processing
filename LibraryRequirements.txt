@@ -1,0 +1,9 @@
+awscli
+s3fs
+h5py
+xarray[complete]
+cfgrib
+pandas
+tqdm
+opencv-python
+numpy
