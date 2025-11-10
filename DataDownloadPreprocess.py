@@ -4,6 +4,7 @@ import subprocess
 import h5py
 import s3fs
 import xarray as xr
+import cfgrib  # <-- IMPORT THE CFGRIB ENGINE DIRECTLY
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -109,7 +110,7 @@ def get_event_data(event_id, catalog):
         ir107_frames = event_rows[event_rows['img_type'] == 'ir107'].copy()
 
         if len(vil_frames) == 0 or len(ir107_frames) == 0:
-            print(f"Info: Event {event_id} missing VIL or IR107 data. Skipping.")
+            #print(f"Info: Event {event_id} missing VIL or IR107 data. Skipping.")
             return None
 
         # Convert to datetime *before* merging
@@ -126,7 +127,7 @@ def get_event_data(event_id, catalog):
         merged_frames = merged_frames.sort_values('time_utc')
 
         if len(merged_frames) == 0:
-            print(f"Info: Event {event_id} has no matching VIL/IR107 timestamps. Skipping.")
+            #print(f"Info: Event {event_id} has no matching VIL/IR107 timestamps. Skipping.")
             return None
 
         return merged_frames
@@ -187,7 +188,7 @@ def process_event(event_id, catalog, s3):
             temp_hrrr_file = os.path.join(TEMP_HRRR_PATH, f"temp_{event_id}_{index}.grib2")
 
             # --- Define datasets for the 'finally' block ---
-            # We only need one list to hold all the datasets
+            # This is the list that cfgrib.open_datasets() will populate
             hrrr_datasets = []
 
             try:
@@ -208,15 +209,14 @@ def process_event(event_id, catalog, s3):
                 lat_slice = slice(center_lat + 1.5, center_lat - 1.5)
                 lon_slice = slice(center_lon - 1.5, center_lon + 1.5)
 
-                # --- START OF open_datasets FIX ---
-
-                # Open the GRIB file ONCE. This returns a LIST of datasets,
-                # splitting the file by conflicting keys (like 'typeOfLevel').
-                hrrr_datasets = xr.open_datasets(
+                # --- START OF CFGRIB FIX ---
+                # Call the cfgrib engine directly, bypassing the old xarray wrapper
+                hrrr_datasets = cfgrib.open_datasets(
                     temp_hrrr_file,
-                    engine='cfgrib',
                     backend_kwargs={'indexpath': ''}
                 )
+                # --- END OF CFGRIB FIX ---
+
 
                 # Now, find the datasets we need from the list
                 ds_t2m = None
@@ -244,12 +244,12 @@ def process_event(event_id, catalog, s3):
                     continue
 
                 # Now, all datasets *should* have coordinates. Set them for indexing.
+                # This is the step that failed on the filter_by_keys approach.
                 ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
                 ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
                 ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
 
                 # A. Get t2m
-                # We also need to select the 2m level specifically
                 hrrr_t2m_sliced = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
                 hrrr_t2m = _get_var(hrrr_t2m_sliced, ['t2m', '2t']).values
 
@@ -261,7 +261,6 @@ def process_event(event_id, catalog, s3):
                 hrrr_cape_sliced = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
                 hrrr_cape = _get_var(hrrr_cape_sliced, ['cape', 'capesfc']).values
 
-                # --- END OF FIX ---
 
                 # Squeeze data
                 hrrr_t2m = np.squeeze(hrrr_t2m)
@@ -368,7 +367,7 @@ def main():
         print("\n--- Starting Data Processing ---")
         print(f"Processed files will be saved to {OUTPUT_PATH}")
 
-        # Get unique event IDs that have both VIL and IR107 data
+        # Get unique event IDs that have both VIL and IR1GET data
         vil_events = set(catalog[catalog['img_type'] == 'vil']['event_id'])
         ir107_events = set(catalog[catalog['img_type'] == 'ir107']['event_id'])
         event_ids_to_process = sorted(list(vil_events.intersection(ir107_events)))
