@@ -4,7 +4,7 @@ import subprocess
 import h5py
 import s3fs
 import xarray as xr
-import cfgrib  # Import the cfgrib engine
+# import cfgrib  <-- No longer need this import
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -187,7 +187,6 @@ def process_event(event_id, catalog, s3, debug=False):
         for index, row in merged_frames.iterrows():
 
             # Get file paths from the merged row
-            # The catalog's file_name already includes the data type folder (vil/ or ir107/)
             local_vil_path = os.path.join(RAW_SEVIR_PATH, row['file_name_vil'])
             local_ir107_path = os.path.join(RAW_SEVIR_PATH, row['file_name_ir107'])
 
@@ -203,7 +202,7 @@ def process_event(event_id, catalog, s3, debug=False):
             temp_hrrr_file = os.path.join(TEMP_HRRR_PATH, f"temp_{event_id}_{index}.grib2")
 
             # --- Define datasets for the 'finally' block ---
-            hrrr_datasets = []
+            ds_all = None  # We only need one dataset object
 
             try:
                 # 1. Download the temp file using s3fs
@@ -223,72 +222,63 @@ def process_event(event_id, catalog, s3, debug=False):
                 lat_slice = slice(center_lat + 1.5, center_lat - 1.5)
                 lon_slice = slice(center_lon - 1.5, center_lon + 1.5)
 
-                # --- Call cfgrib directly ---
-                hrrr_datasets = cfgrib.open_datasets(
+                # --- START OF NEW FIX ---
+                # Use xr.open_dataset (singular) but pass join='outer'
+                # This tells the cfgrib engine to merge the internal
+                # datasets (surface, isobaricInhPa, etc.) correctly.
+                ds_all = xr.open_dataset(
                     temp_hrrr_file,
+                    engine='cfgrib',
+                    join='outer',  # <-- THIS IS THE CRITICAL FIX
                     backend_kwargs={'indexpath': ''}
                 )
+                # --- END OF NEW FIX ---
 
-                # --- FIXED LOGIC: Use separate IF statements instead of ELIF ---
-                # Define candidate names, just like in _get_var
+                # --- Check for variables in the single merged dataset ---
                 t2m_candidates = ['t2m', '2t']
                 prmsl_candidates = ['prmsl', 'msl', 'mslet']
                 cape_candidates = ['cape', 'capesfc']
 
-                ds_t2m = None
-                ds_prmsl = None
-                ds_cape = None
+                t2m_found = any(var in ds_all.variables for var in t2m_candidates)
+                cape_found = any(var in ds_all.variables for var in cape_candidates)
+                prmsl_found = any(var in ds_all.variables for var in prmsl_candidates)
 
-                # Loop through the datasets and check against ALL candidates
-                # IMPORTANT: Use separate IF statements, not ELIF, so we check all conditions
-                for ds in hrrr_datasets:
-                    # Check if any t2m candidate is in this dataset
-                    if ds_t2m is None and any(var in ds.variables for var in t2m_candidates):
-                        ds_t2m = ds
-                    # Check if any prmsl candidate is in this dataset
-                    if ds_prmsl is None and any(var in ds.variables for var in prmsl_candidates):
-                        ds_prmsl = ds
-                    # Check if any cape candidate is in this dataset
-                    if ds_cape is None and any(var in ds.variables for var in cape_candidates):
-                        ds_cape = ds
-
-                # Check if we found required variables (t2m and cape are required, prmsl is optional)
-                if ds_t2m is None or ds_cape is None:
+                # Check if we found required variables
+                if not t2m_found or not cape_found:
                     missing = []
-                    if ds_t2m is None: missing.append('t2m')
-                    if ds_cape is None: missing.append('cape')
+                    if not t2m_found: missing.append('t2m')
+                    if not cape_found: missing.append('cape')
                     if debug:
                         print(
-                            f"Warning: Could not find datasets for {missing} in GRIB file for {event_id}. Skipping frame.")
+                            f"Warning: Could not find required variables {missing} in GRIB file for {event_id}. Skipping frame.")
                     continue
 
                 # prmsl is optional - log if missing but continue processing
-                if ds_prmsl is None and debug:
+                if not prmsl_found and debug:
                     print(f"Info: PRMSL not found for {event_id}, will use zeros.")
 
-                # Now, all datasets *should* have coordinates. Set them for indexing.
-                ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
-                ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
-                if ds_prmsl is not None:
-                    ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
+                # Now, set coordinates ONCE on the merged dataset
+                # This should now work
+                ds_all = ds_all.set_coords(['latitude', 'longitude'])
 
                 # A. Get t2m
-                hrrr_t2m_sliced = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
+                hrrr_t2m_sliced = ds_all.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
                 hrrr_t2m = _get_var(hrrr_t2m_sliced, t2m_candidates).values
 
                 # B. Get prmsl (optional - use zeros if not available)
-                if ds_prmsl is not None:
+                if prmsl_found:
                     try:
-                        hrrr_prmsl_sliced = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
+                        hrrr_prmsl_sliced = ds_all.sel(latitude=lat_slice, longitude=lon_slice)
                         hrrr_prmsl = _get_var(hrrr_prmsl_sliced, prmsl_candidates).values
                         hrrr_prmsl = np.squeeze(hrrr_prmsl)
-                    except:
-                        hrrr_prmsl = None
+                    except Exception as e:
+                        if debug: print(f"Warning: Error extracting prmsl: {e}")
+                        hrrr_prmsl = None  # Fallback
                 else:
                     hrrr_prmsl = None
 
                 # C. Get cape
-                hrrr_cape_sliced = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
+                hrrr_cape_sliced = ds_all.sel(latitude=lat_slice, longitude=lon_slice)
                 hrrr_cape = _get_var(hrrr_cape_sliced, cape_candidates).values
 
                 # Squeeze data
@@ -327,12 +317,13 @@ def process_event(event_id, catalog, s3, debug=False):
                 print(f"Warning: Error processing frame for event {event_id}: {e}. Skipping frame.")
             finally:
                 # 3. ALWAYS close all datasets and delete the temp file
-                # We must close *every* dataset in the list
-                for ds in hrrr_datasets:
+
+                # Close the single merged dataset
+                if ds_all is not None:
                     try:
-                        ds.close()
+                        ds_all.close()
                     except:
-                        pass  # Ignore errors when closing
+                        pass
 
                 # Try to delete the temp file, with retries if it's locked
                 if os.path.exists(temp_hrrr_file):
@@ -357,6 +348,7 @@ def process_event(event_id, catalog, s3, debug=False):
                 print(f"Event {event_id}: Successfully saved {len(event_sequence)} frames to {output_filepath}")
         else:
             if debug:
+                # Changed minimum to 1 to match the save condition
                 print(f"Event {event_id}: Only got {len(event_sequence)} frames, need at least 1. Skipping.")
 
     except Exception as e:
