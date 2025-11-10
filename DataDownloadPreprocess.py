@@ -4,7 +4,7 @@ import subprocess
 import h5py
 import s3fs
 import xarray as xr
-import cfgrib  # <-- IMPORT THE CFGRIB ENGINE DIRECTLY
+import cfgrib  # Import the cfgrib engine
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -110,7 +110,7 @@ def get_event_data(event_id, catalog):
         ir107_frames = event_rows[event_rows['img_type'] == 'ir107'].copy()
 
         if len(vil_frames) == 0 or len(ir107_frames) == 0:
-            #print(f"Info: Event {event_id} missing VIL or IR107 data. Skipping.")
+            # print(f"Info: Event {event_id} missing VIL or IR107 data. Skipping.")
             return None
 
         # Convert to datetime *before* merging
@@ -127,7 +127,7 @@ def get_event_data(event_id, catalog):
         merged_frames = merged_frames.sort_values('time_utc')
 
         if len(merged_frames) == 0:
-            #print(f"Info: Event {event_id} has no matching VIL/IR107 timestamps. Skipping.")
+            # print(f"Info: Event {event_id} has no matching VIL/IR107 timestamps. Skipping.")
             return None
 
         return merged_frames
@@ -188,7 +188,6 @@ def process_event(event_id, catalog, s3):
             temp_hrrr_file = os.path.join(TEMP_HRRR_PATH, f"temp_{event_id}_{index}.grib2")
 
             # --- Define datasets for the 'finally' block ---
-            # This is the list that cfgrib.open_datasets() will populate
             hrrr_datasets = []
 
             try:
@@ -209,30 +208,34 @@ def process_event(event_id, catalog, s3):
                 lat_slice = slice(center_lat + 1.5, center_lat - 1.5)
                 lon_slice = slice(center_lon - 1.5, center_lon + 1.5)
 
-                # --- START OF CFGRIB FIX ---
-                # Call the cfgrib engine directly, bypassing the old xarray wrapper
+                # --- Call cfgrib directly ---
                 hrrr_datasets = cfgrib.open_datasets(
                     temp_hrrr_file,
                     backend_kwargs={'indexpath': ''}
                 )
-                # --- END OF CFGRIB FIX ---
 
+                # --- START OF LOGIC FIX ---
+                # Define candidate names, just like in _get_var
+                t2m_candidates = ['t2m', '2t']
+                prmsl_candidates = ['prmsl', 'msl', 'mslet']
+                cape_candidates = ['cape', 'capesfc']
 
-                # Now, find the datasets we need from the list
                 ds_t2m = None
                 ds_prmsl = None
                 ds_cape = None
 
+                # Loop through the datasets and check against ALL candidates
                 for ds in hrrr_datasets:
-                    # Check for t2m (heightAboveGround)
-                    if 't2m' in ds.variables:
+                    # Check if any t2m candidate is in this dataset
+                    if any(var in ds.variables for var in t2m_candidates):
                         ds_t2m = ds
-                    # Check for prmsl (meanSea)
-                    elif 'prmsl' in ds.variables:
+                    # Check if any prmsl candidate is in this dataset
+                    elif any(var in ds.variables for var in prmsl_candidates):
                         ds_prmsl = ds
-                    # Check for cape (surface)
-                    elif 'cape' in ds.variables:
+                    # Check if any cape candidate is in this dataset
+                    elif any(var in ds.variables for var in cape_candidates):
                         ds_cape = ds
+                # --- END OF LOGIC FIX ---
 
                 # Check if we found all three
                 if ds_t2m is None or ds_prmsl is None or ds_cape is None:
@@ -240,27 +243,26 @@ def process_event(event_id, catalog, s3):
                     if ds_t2m is None: missing.append('t2m')
                     if ds_prmsl is None: missing.append('prmsl')
                     if ds_cape is None: missing.append('cape')
-                    print(f"Warning: Could not find variables {missing} in GRIB file for {event_id}. Skipping frame.")
+                    print(
+                        f"Warning: Could not find datasets for {missing} in GRIB file for {event_id}. Skipping frame.")
                     continue
 
                 # Now, all datasets *should* have coordinates. Set them for indexing.
-                # This is the step that failed on the filter_by_keys approach.
                 ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
                 ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
                 ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
 
                 # A. Get t2m
                 hrrr_t2m_sliced = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
-                hrrr_t2m = _get_var(hrrr_t2m_sliced, ['t2m', '2t']).values
+                hrrr_t2m = _get_var(hrrr_t2m_sliced, t2m_candidates).values
 
                 # B. Get prmsl
                 hrrr_prmsl_sliced = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
-                hrrr_prmsl = _get_var(hrrr_prmsl_sliced, ['prmsl', 'msl', 'mslet']).values
+                hrrr_prmsl = _get_var(hrrr_prmsl_sliced, prmsl_candidates).values
 
                 # C. Get cape
                 hrrr_cape_sliced = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
-                hrrr_cape = _get_var(hrrr_cape_sliced, ['cape', 'capesfc']).values
-
+                hrrr_cape = _get_var(hrrr_cape_sliced, cape_candidates).values
 
                 # Squeeze data
                 hrrr_t2m = np.squeeze(hrrr_t2m)
@@ -307,6 +309,8 @@ def process_event(event_id, catalog, s3):
 
     except Exception as e:
         print(f"CRITICAL Error processing event {event_id}: {e}. Skipping entire event.")
+
+
 def main():
     """Main function to run the entire pipeline."""
     # --- 1. Setup ---
@@ -385,7 +389,7 @@ def main():
         print("\nProcessing storms:")
         for event_id in tqdm(event_ids_to_process, desc="Processing All Storms"):
             # Pass the s3 object to the function
-            process_event(event_id, catalog, s3) # <-- PASS s3 OBJECT HERE
+            process_event(event_id, catalog, s3)  # <-- PASS s3 OBJECT HERE
 
         print("\n--- Data Processing Complete ---")
         print(f"Your final, processed .npy files are located in: {OUTPUT_PATH}")
