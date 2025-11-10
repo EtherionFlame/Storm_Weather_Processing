@@ -1,5 +1,4 @@
-# FULL FIXED VERSION OF YOUR SCRIPT
-# Includes working HRRR GRIB loader using cfgrib group-merging
+
 
 import os
 import subprocess
