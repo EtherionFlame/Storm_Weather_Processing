@@ -12,389 +12,304 @@ import cv2  # Used for image resizing
 from tqdm import tqdm
 import urllib.request  # Import the built-in library
 import sys  # Import sys to allow exiting
+import hashlib  # For caching HRRR filenames
 
 # =============================================================================
 # --- 1. CONFIGURATION: SET YOUR PATHS HERE ---
 # =============================================================================
 
-# file path for drive
 BASE_DRIVE_PATH = 'D:/'
 
-# --- Project Paths (Script will create these) ---
+# --- Project Paths ---
 PROJECT_PATH = os.path.join(BASE_DRIVE_PATH, 'WeatherProject')
 RAW_SEVIR_PATH = os.path.join(PROJECT_PATH, 'RawSEVIRData')
 OUTPUT_PATH = os.path.join(PROJECT_PATH, 'ProcessedData')
 CATALOG_PATH = os.path.join(PROJECT_PATH, 'CATALOG.csv')
 
-# --- NEW: Temporary folder for downloading HRRR files ---
-TEMP_HRRR_PATH = os.path.join(PROJECT_PATH, 'temp_hrrr')
+# --- HRRR CACHE (reused files for speed) ---
+HRRR_CACHE = os.path.join(PROJECT_PATH, 'HRRR_CACHE')
 
 
 # =============================================================================
-
+# --- Utilities ---
+# =============================================================================
 
 def download_catalog():
     """Downloads the SEVIR catalog if it doesn't exist."""
     if os.path.exists(CATALOG_PATH):
-        # Check file size. If it's tiny, it's a bad download.
-        if os.path.getsize(CATALOG_PATH) < 1000000:
-            print("Catalog file exists but is too small. Deleting and re-downloading.")
-            try:
-                os.remove(CATALOG_PATH)
-            except Exception as e:
-                print(f"Could not delete file: {e}. Please delete it manually.")
-                return False
+        if os.path.getsize(CATALOG_PATH) < 500000:  # <0.5MB is probably broken
+            os.remove(CATALOG_PATH)
         else:
-            print(f"Catalog already exists at {CATALOG_PATH}")
-            return True  # Catalog exists and is large enough
+            print("CATALOG already exists.")
+            return True
 
     print("Downloading SEVIR CATALOG.csv...")
     try:
         url = 'https://raw.githubusercontent.com/MIT-AI-Accelerator/eie-sevir/master/CATALOG.csv'
-        # Use urllib to download the file, removing the 'requests' dependency
         urllib.request.urlretrieve(url, CATALOG_PATH)
-        print("Catalog download complete.")
+        print("Catalog downloaded.")
         return True
     except Exception as e:
-        print(f"Error downloading catalog: {e}")
-        print("Please check internet connection or permissions.")
+        print("Error downloading CATALOG:", e)
         return False
 
 
 def download_sevir_data_type(data_type):
-    """
-    Downloads a single data type (e.g., 'vil', 'ir107') from the SEVIR dataset.
-    This function is RESUMABLE.
-    """
-    print(f"--- Starting SEVIR '{data_type}' Data Download ---")
+    print(f"--- Downloading SEVIR {data_type} ---")
     s3_source_path = f's3://sevir/data/{data_type}'
     local_destination_path = os.path.join(RAW_SEVIR_PATH, data_type)
-    print(f"Source: {s3_source_path}")
-    print(f"Destination: {local_destination_path}")
-    print("This will take a long time. AWS CLI will show live progress in your terminal.")
-    print("If you stop (Ctrl+C), just run the script again to resume.")
     os.makedirs(local_destination_path, exist_ok=True)
+
     command = [
         'aws', 's3', 'sync',
         s3_source_path,
         local_destination_path,
         '--no-sign-request'
     ]
+
     try:
         subprocess.run(command)
-        print(f"--- '{data_type}' Data Download Complete ---")
-    except FileNotFoundError:
-        print("Error: 'aws' command not found.")
-        print("Please install the AWS CLI and ensure it is in your system's PATH.")
     except Exception as e:
-        print(f"An error occurred during the download: {e}")
+        print("AWS S3 Sync Error:", e)
 
 
 def build_hrrr_url(timestamp):
-    """Constructs the S3 URL for an HRRR file given a timestamp."""
     dt = pd.to_datetime(timestamp)
-    date_str = dt.strftime('%Y%m%d')
-    hour_str = dt.strftime('%H')
-    return f's3://noaa-hrrr-bdp-pds/hrrr.{date_str}/conus/hrrr.t{hour_str}z.wrfsfcf00.grib2'
+    return (
+        f"s3://noaa-hrrr-bdp-pds/hrrr.{dt:%Y%m%d}/conus/"
+        f"hrrr.t{dt:%H}z.wrfsfcf00.grib2"
+    )
 
 
 def get_event_data(event_id, catalog):
-    """
-    Gets all frames for a given event_id from the catalog.
-    Merges VIL and IR107 dataframes on 'time_utc' to ensure perfect alignment.
-    """
+    """Returns rows where VIL + IR107 timestamps match."""
     try:
-        event_rows = catalog[catalog['event_id'] == event_id].copy()
+        rows = catalog[catalog['event_id'] == event_id].copy()
+        vil = rows[rows['img_type'] == 'vil'].copy()
+        ir107 = rows[rows['img_type'] == 'ir107'].copy()
 
-        vil_frames = event_rows[event_rows['img_type'] == 'vil'].copy()
-        ir107_frames = event_rows[event_rows['img_type'] == 'ir107'].copy()
-
-        if len(vil_frames) == 0 or len(ir107_frames) == 0:
-            # print(f"Info: Event {event_id} missing VIL or IR107 data. Skipping.")
+        if len(vil) == 0 or len(ir107) == 0:
             return None
 
-        # Convert to datetime *before* merging
-        vil_frames['time_utc'] = pd.to_datetime(vil_frames['time_utc'])
-        ir107_frames['time_utc'] = pd.to_datetime(ir107_frames['time_utc'])
+        vil['time_utc'] = pd.to_datetime(vil['time_utc'])
+        ir107['time_utc'] = pd.to_datetime(ir107['time_utc'])
 
-        merged_frames = pd.merge(
-            vil_frames,
-            ir107_frames,
+        merged = pd.merge(
+            vil,
+            ir107,
             on='time_utc',
             suffixes=('_vil', '_ir107')
-        )
+        ).sort_values('time_utc')
 
-        merged_frames = merged_frames.sort_values('time_utc')
-
-        if len(merged_frames) == 0:
-            # print(f"Info: Event {event_id} has no matching VIL/IR107 timestamps. Skipping.")
+        if len(merged) == 0:
             return None
 
-        return merged_frames
-
-    except Exception as e:
-        print(f"Error getting event data for {event_id}: {e}")
+        return merged
+    except:
         return None
 
 
-def _get_var(ds, candidates):
-    """
-    Helper function to robustly get a variable from an xarray.Dataset
-    by trying a list of possible candidate names.
-    """
-    for name in candidates:
-        if name in ds.variables:
-            return ds[name]
-    raise KeyError(f"None of the variables found: {candidates}. Available: {list(ds.variables)}")
+# =============================================================================
+# --- HRRR CACHE SYSTEM ---
+# =============================================================================
 
+def get_local_hrrr_path(hrrr_url, s3):
+    """Downloads an HRRR file once and reuses it."""
+    os.makedirs(HRRR_CACHE, exist_ok=True)
+
+    # deterministic filename
+    file_hash = hashlib.md5(hrrr_url.encode()).hexdigest()
+    local_path = os.path.join(HRRR_CACHE, f"{file_hash}.grib2")
+
+    if not os.path.exists(local_path):
+        print(f"Downloading HRRR to cache: {hrrr_url}")
+        try:
+            s3.get(hrrr_url, local_path)
+        except Exception as e:
+            print("HRRR download failed:", e)
+            return None
+
+    return local_path
+
+
+# =============================================================================
+# --- HRRR VARIABLE HANDLING (PRMSL OPTIONAL) ---
+# =============================================================================
+
+def _get_var(ds, candidates):
+    for c in candidates:
+        if c in ds.variables:
+            return ds[c]
+    raise KeyError(f"No matching vars from {candidates}")
+
+
+# =============================================================================
+# --- Processing ---
+# =============================================================================
 
 def process_event(event_id, catalog, s3):
-    """
-    Processes a single storm event. Assumes raw SEVIR files are already
-    downloaded in RAW_SEVIR_PATH. Downloads HRRR data to a temp folder,
-    processes it, and then deletes it.
-    This function is resumable.
-    """
-    output_filepath = os.path.join(OUTPUT_PATH, f'storm_{event_id}.npy')
-    if os.path.exists(output_filepath):
-        return  # Event already processed, skip
+    output_path = os.path.join(OUTPUT_PATH, f"storm_{event_id}.npy")
 
-    try:
-        # Get the merged and time-aligned dataframe for this event
-        merged_frames = get_event_data(event_id, catalog)
+    if os.path.exists(output_path):
+        return
 
-        if merged_frames is None:
-            return  # Skip if we can't get event data
+    merged = get_event_data(event_id, catalog)
+    if merged is None:
+        return
 
-        # Get center coordinates from first VIL frame
-        first_row = merged_frames.iloc[0]
-        center_lat = (first_row['llcrnrlat_vil'] + first_row['urcrnrlat_vil']) / 2
-        center_lon = (first_row['llcrnrlon_vil'] + first_row['urcrnrlon_vil']) / 2
+    # storm center comes from VIL box
+    row0 = merged.iloc[0]
+    center_lat = (row0['llcrnrlat_vil'] + row0['urcrnrlat_vil']) / 2
+    center_lon = (row0['llcrnrlon_vil'] + row0['urcrnrlon_vil']) / 2
 
-        event_sequence = []
+    # slices (HRRR lat is descending)
+    lat_slice = slice(center_lat + 1.5, center_lat - 1.5)
+    lon_slice = slice(center_lon - 1.5, center_lon + 1.5)
 
-        # Process each aligned frame
-        for index, row in merged_frames.iterrows():
+    event_frames = []
 
-            # Get file paths from the merged row
-            local_vil_path = os.path.join(RAW_SEVIR_PATH, row['file_name_vil'])
-            local_ir107_path = os.path.join(RAW_SEVIR_PATH, row['file_name_ir107'])
+    for idx, row in merged.iterrows():
 
-            if not os.path.exists(local_vil_path) or not os.path.exists(local_ir107_path):
-                continue  # Skip this frame if data is missing
+        # SEVIR paths
+        path_vil = os.path.join(RAW_SEVIR_PATH, row['file_name_vil'])
+        path_ir = os.path.join(RAW_SEVIR_PATH, row['file_name_ir107'])
 
-            timestamp = row['time_utc']  # Already a datetime object
-            hrrr_url = build_hrrr_url(timestamp)
-            temp_hrrr_file = os.path.join(TEMP_HRRR_PATH, f"temp_{event_id}_{index}.grib2")
+        if not os.path.exists(path_vil) or not os.path.exists(path_ir):
+            continue
 
-            # --- Define datasets for the 'finally' block ---
-            hrrr_datasets = []
+        # load SEVIR data
+        try:
+            with h5py.File(path_vil, "r") as f:
+                vil = np.squeeze(f['vil'][row['file_index_vil']])
+            with h5py.File(path_ir, "r") as f:
+                ir = np.squeeze(f['ir107'][row['file_index_ir107']])
+        except:
+            continue
 
+        # --- HRRR ---
+        hrrr_url = build_hrrr_url(row['time_utc'])
+        local_hrrr = get_local_hrrr_path(hrrr_url, s3)
+        if local_hrrr is None:
+            continue
+
+        try:
+            ds_list = cfgrib.open_datasets(local_hrrr, backend_kwargs={'indexpath': ''})
+        except Exception as e:
+            print("cfgrib could not parse HRRR file:", e)
+            continue
+
+        # candidates
+        t2m_c = ['t2m', '2t']
+        cape_c = ['cape', 'capesfc']
+        prmsl_c = ['prmsl', 'msl', 'mslet', 'MSLET_P0_L101_GLC0']
+
+        ds_t2m = None
+        ds_cape = None
+        ds_prmsl = None
+
+        for ds in ds_list:
+            vars = ds.variables
+            if any(v in vars for v in t2m_c):
+                ds_t2m = ds
+            elif any(v in vars for v in cape_c):
+                ds_cape = ds
+            elif any(v in vars for v in prmsl_c):
+                ds_prmsl = ds  # optional
+
+        # required vars
+        if ds_t2m is None or ds_cape is None:
+            continue
+
+        # coords
+        ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
+        ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
+        if ds_prmsl:
+            ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
+
+        # extract T2M
+        try:
+            slc = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
+            t2m = np.squeeze(_get_var(slc, t2m_c).values)
+        except:
+            continue
+
+        # extract CAPE
+        try:
+            slc = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
+            cape = np.squeeze(_get_var(slc, cape_c).values)
+        except:
+            continue
+
+        # extract PRMSL (optional)
+        if ds_prmsl:
             try:
-                # 1. Download the temp file using s3fs
-                s3.get(hrrr_url, temp_hrrr_file)
+                slc = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
+                prmsl = np.squeeze(_get_var(slc, prmsl_c).values)
+            except:
+                prmsl = np.zeros_like(cape)
+        else:
+            prmsl = np.zeros_like(cape)
 
-                # Read SEVIR data
-                with h5py.File(local_vil_path, 'r') as hf:
-                    vil_data = hf['vil'][row['file_index_vil']]
+        # resize HRRR → 384×384
+        size = (384, 384)
+        t2m = cv2.resize(t2m, size)
+        cape = cv2.resize(cape, size)
+        prmsl = cv2.resize(prmsl, size)
 
-                with h5py.File(local_ir107_path, 'r') as hf:
-                    ir107_data = hf['ir107'][row['file_index_ir107']]
+        # resize IR107
+        ir = cv2.resize(ir, size)
 
-                # Squeeze data to 2D
-                vil_data = np.squeeze(vil_data)
-                ir107_data = np.squeeze(ir107_data)
+        # stack
+        frame = np.stack([vil, ir, t2m, prmsl, cape], axis=-1)
+        event_frames.append(frame)
 
-                lat_slice = slice(center_lat + 1.5, center_lat - 1.5)
-                lon_slice = slice(center_lon - 1.5, center_lon + 1.5)
+        # close GRIB datasets
+        for ds in ds_list:
+            ds.close()
 
-                # --- Call cfgrib directly ---
-                hrrr_datasets = cfgrib.open_datasets(
-                    temp_hrrr_file,
-                    backend_kwargs={'indexpath': ''}
-                )
+    if len(event_frames) > 0:
+        np.save(output_path, np.array(event_frames))
 
-                # --- START OF LOGIC FIX ---
-                # Define candidate names, just like in _get_var
-                t2m_candidates = ['t2m', '2t']
-                prmsl_candidates = ['prmsl', 'msl', 'mslet']
-                cape_candidates = ['cape', 'capesfc']
 
-                ds_t2m = None
-                ds_prmsl = None
-                ds_cape = None
-
-                # Loop through the datasets and check against ALL candidates
-                for ds in hrrr_datasets:
-                    # Check if any t2m candidate is in this dataset
-                    if any(var in ds.variables for var in t2m_candidates):
-                        ds_t2m = ds
-                    # Check if any prmsl candidate is in this dataset
-                    elif any(var in ds.variables for var in prmsl_candidates):
-                        ds_prmsl = ds
-                    # Check if any cape candidate is in this dataset
-                    elif any(var in ds.variables for var in cape_candidates):
-                        ds_cape = ds
-                # --- END OF LOGIC FIX ---
-
-                # Check if we found all three
-                if ds_t2m is None or ds_prmsl is None or ds_cape is None:
-                    missing = []
-                    if ds_t2m is None: missing.append('t2m')
-                    if ds_prmsl is None: missing.append('prmsl')
-                    if ds_cape is None: missing.append('cape')
-                    print(
-                        f"Warning: Could not find datasets for {missing} in GRIB file for {event_id}. Skipping frame.")
-                    continue
-
-                # Now, all datasets *should* have coordinates. Set them for indexing.
-                ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
-                ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
-                ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
-
-                # A. Get t2m
-                hrrr_t2m_sliced = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
-                hrrr_t2m = _get_var(hrrr_t2m_sliced, t2m_candidates).values
-
-                # B. Get prmsl
-                hrrr_prmsl_sliced = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
-                hrrr_prmsl = _get_var(hrrr_prmsl_sliced, prmsl_candidates).values
-
-                # C. Get cape
-                hrrr_cape_sliced = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
-                hrrr_cape = _get_var(hrrr_cape_sliced, cape_candidates).values
-
-                # Squeeze data
-                hrrr_t2m = np.squeeze(hrrr_t2m)
-                hrrr_prmsl = np.squeeze(hrrr_prmsl)
-                hrrr_cape = np.squeeze(hrrr_cape)
-
-                # Resize all data
-                target_size = (384, 384)
-                hrrr_t2m_resized = cv2.resize(hrrr_t2m, target_size, interpolation=cv2.INTER_LINEAR)
-                hrrr_prmsl_resized = cv2.resize(hrrr_prmsl, target_size, interpolation=cv2.INTER_LINEAR)
-                hrrr_cape_resized = cv2.resize(hrrr_cape, target_size, interpolation=cv2.INTER_LINEAR)
-                sevir_ir107_resized = cv2.resize(ir107_data, target_size, interpolation=cv2.INTER_LINEAR)
-
-                # Stack the 5 channels
-                combined_frame = np.stack([
-                    vil_data,
-                    sevir_ir107_resized,
-                    hrrr_t2m_resized,
-                    hrrr_prmsl_resized,
-                    hrrr_cape_resized
-                ], axis=-1)
-
-                event_sequence.append(combined_frame)
-
-            except FileNotFoundError:
-                print(f"Warning: HRRR file not found for event {event_id}, timestamp {timestamp}. Skipping frame.")
-            except KeyError as e:
-                # This will catch "no index found", "None of the variables found", and the "latitude" key error
-                print(f"Warning: Missing data for event {event_id}: {e}. Skipping frame.")
-            except Exception as e:
-                print(f"Warning: Error processing frame for event {event_id}: {e}. Skipping frame.")
-            finally:
-                # 3. ALWAYS close all datasets and delete the temp file
-                # We must close *every* dataset in the list
-                for ds in hrrr_datasets:
-                    ds.close()
-
-                if os.path.exists(temp_hrrr_file):
-                    os.remove(temp_hrrr_file)
-
-        if len(event_sequence) >= 10:  # Only save if we got at least 10 valid frames
-            final_sequence = np.array(event_sequence)
-            np.save(output_filepath, final_sequence)
-
-    except Exception as e:
-        print(f"CRITICAL Error processing event {event_id}: {e}. Skipping entire event.")
-
+# =============================================================================
+# --- MAIN ---
+# =============================================================================
 
 def main():
-    """Main function to run the entire pipeline."""
-    # --- 1. Setup ---
-    print(f"Project Path: {PROJECT_PATH}")
-    print(f"Raw SEVIR Data Path: {RAW_SEVIR_PATH}")
-    print(f"Processed Data Path: {OUTPUT_PATH}")
-    print(f"Temporary HRRR Path: {TEMP_HRRR_PATH}")  # New path
-
-    os.makedirs(PROJECT_PATH, exist_ok=True)
+    print("Initializing paths...")
     os.makedirs(RAW_SEVIR_PATH, exist_ok=True)
     os.makedirs(OUTPUT_PATH, exist_ok=True)
-    os.makedirs(TEMP_HRRR_PATH, exist_ok=True)  # Create the temp folder
+    os.makedirs(HRRR_CACHE, exist_ok=True)
 
-    # --- 2. Download & VERIFY Catalog ---
-    try:
-        if not download_catalog():
-            raise Exception("Failed to download catalog. Please check permissions or download manually.")
+    # Catalog
+    if not download_catalog():
+        print("Catalog download failed.")
+        return
 
-        print("--- Verifying Catalog File ---")
-        file_size = os.path.getsize(CATALOG_PATH)
-        print(f"File size on disk: {file_size} bytes")
+    catalog = pd.read_csv(CATALOG_PATH)
+    required = ['event_id', 'img_type', 'time_utc',
+                'file_name', 'file_index',
+                'llcrnrlat', 'llcrnrlon', 'urcrnrlat', 'urcrnrlon']
 
-        catalog = pd.read_csv(CATALOG_PATH, low_memory=False)
-        print("\nColumns found in catalog:")
-        print(list(catalog.columns))
+    for r in required:
+        if r not in catalog.columns:
+            print("Missing required column:", r)
+            return
 
-        # Check for required columns
-        required_cols = ['event_id', 'img_type', 'time_utc', 'file_name', 'file_index',
-                         'llcrnrlat', 'llcrnrlon', 'urcrnrlat', 'urcrnrlon']
-        missing_cols = [col for col in required_cols if col not in catalog.columns]
+    # Processing
+    vil_events = set(catalog[catalog['img_type'] == 'vil']['event_id'])
+    ir_events = set(catalog[catalog['img_type'] == 'ir107']['event_id'])
+    events = sorted(list(vil_events.intersection(ir_events)))
 
-        if missing_cols:
-            raise Exception(f"Verification FAILED: Missing columns: {missing_cols}")
+    print(f"Processing {len(events)} events.")
 
-        print("\n--- Catalog Verification Successful ---")
+    # s3 client
+    s3 = s3fs.S3FileSystem(anon=True)
 
-    except Exception as e:
-        print(f"CRITICAL ERROR: Failed to load or verify the CATALOG.csv file.")
-        print(f"Error: {e}")
-        sys.exit()
+    for eid in tqdm(events, desc="Processing Events"):
+        process_event(eid, catalog, s3)
 
-    # --- 3. Download Raw SEVIR Data (In Chunks) ---
-    print("\n--- CONFIGURE YOUR DOWNLOAD ---")
-    DOWNLOAD_VIL = False
-    DOWNLOAD_IR107 = False
-
-    if DOWNLOAD_VIL:
-        download_sevir_data_type('vil')
-
-    if DOWNLOAD_IR107:
-        download_sevir_data_type('ir107')
-
-    # --- 4. Process All Data ---
-    print("\n--- CONFIGURE YOUR PROCESSING ---")
-    RUN_PROCESSING = True
-
-    if RUN_PROCESSING:
-        print("\n--- Starting Data Processing ---")
-        print(f"Processed files will be saved to {OUTPUT_PATH}")
-
-        # Get unique event IDs that have both VIL and IR1GET data
-        vil_events = set(catalog[catalog['img_type'] == 'vil']['event_id'])
-        ir107_events = set(catalog[catalog['img_type'] == 'ir107']['event_id'])
-        event_ids_to_process = sorted(list(vil_events.intersection(ir107_events)))
-
-        print(f"\nFound {len(event_ids_to_process)} events with both VIL and IR107 data.")
-
-        # --- THIS IS THE FIX ---
-        # Initialize the S3 filesystem ONCE here for efficiency.
-        # 'anon=True' means we're accessing a public bucket (no login needed).
-        print("Initializing S3 file system for HRRR data...")
-        s3 = s3fs.S3FileSystem(anon=True)
-        # --- END OF FIX ---
-
-        # Run the processing loop with a progress bar
-        print("\nProcessing storms:")
-        for event_id in tqdm(event_ids_to_process, desc="Processing All Storms"):
-            # Pass the s3 object to the function
-            process_event(event_id, catalog, s3)  # <-- PASS s3 OBJECT HERE
-
-        print("\n--- Data Processing Complete ---")
-        print(f"Your final, processed .npy files are located in: {OUTPUT_PATH}")
-    else:
-        print("Skipping processing step as RUN_PROCESSING is set to False.")
+    print("All events processed.")
 
 
 if __name__ == "__main__":
