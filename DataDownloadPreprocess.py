@@ -252,28 +252,40 @@ def process_event(event_id, catalog, s3, debug=False):
                     if ds_cape is None and any(var in ds.variables for var in cape_candidates):
                         ds_cape = ds
 
-                # Check if we found all three
-                if ds_t2m is None or ds_prmsl is None or ds_cape is None:
+                # Check if we found required variables (t2m and cape are required, prmsl is optional)
+                if ds_t2m is None or ds_cape is None:
                     missing = []
                     if ds_t2m is None: missing.append('t2m')
-                    if ds_prmsl is None: missing.append('prmsl')
                     if ds_cape is None: missing.append('cape')
-                    print(
-                        f"Warning: Could not find datasets for {missing} in GRIB file for {event_id}. Skipping frame.")
+                    if debug:
+                        print(
+                            f"Warning: Could not find datasets for {missing} in GRIB file for {event_id}. Skipping frame.")
                     continue
+
+                # prmsl is optional - log if missing but continue processing
+                if ds_prmsl is None and debug:
+                    print(f"Info: PRMSL not found for {event_id}, will use zeros.")
 
                 # Now, all datasets *should* have coordinates. Set them for indexing.
                 ds_t2m = ds_t2m.set_coords(['latitude', 'longitude'])
-                ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
                 ds_cape = ds_cape.set_coords(['latitude', 'longitude'])
+                if ds_prmsl is not None:
+                    ds_prmsl = ds_prmsl.set_coords(['latitude', 'longitude'])
 
                 # A. Get t2m
                 hrrr_t2m_sliced = ds_t2m.sel(latitude=lat_slice, longitude=lon_slice, heightAboveGround=2)
                 hrrr_t2m = _get_var(hrrr_t2m_sliced, t2m_candidates).values
 
-                # B. Get prmsl
-                hrrr_prmsl_sliced = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
-                hrrr_prmsl = _get_var(hrrr_prmsl_sliced, prmsl_candidates).values
+                # B. Get prmsl (optional - use zeros if not available)
+                if ds_prmsl is not None:
+                    try:
+                        hrrr_prmsl_sliced = ds_prmsl.sel(latitude=lat_slice, longitude=lon_slice)
+                        hrrr_prmsl = _get_var(hrrr_prmsl_sliced, prmsl_candidates).values
+                        hrrr_prmsl = np.squeeze(hrrr_prmsl)
+                    except:
+                        hrrr_prmsl = None
+                else:
+                    hrrr_prmsl = None
 
                 # C. Get cape
                 hrrr_cape_sliced = ds_cape.sel(latitude=lat_slice, longitude=lon_slice)
@@ -281,14 +293,18 @@ def process_event(event_id, catalog, s3, debug=False):
 
                 # Squeeze data
                 hrrr_t2m = np.squeeze(hrrr_t2m)
-                hrrr_prmsl = np.squeeze(hrrr_prmsl)
                 hrrr_cape = np.squeeze(hrrr_cape)
 
                 # Resize all data
                 target_size = (384, 384)
                 hrrr_t2m_resized = cv2.resize(hrrr_t2m, target_size, interpolation=cv2.INTER_LINEAR)
-                hrrr_prmsl_resized = cv2.resize(hrrr_prmsl, target_size, interpolation=cv2.INTER_LINEAR)
                 hrrr_cape_resized = cv2.resize(hrrr_cape, target_size, interpolation=cv2.INTER_LINEAR)
+
+                # Handle prmsl - use zeros if not available
+                if hrrr_prmsl is not None:
+                    hrrr_prmsl_resized = cv2.resize(hrrr_prmsl, target_size, interpolation=cv2.INTER_LINEAR)
+                else:
+                    hrrr_prmsl_resized = np.zeros(target_size, dtype=np.float32)
                 sevir_ir107_resized = cv2.resize(ir107_data, target_size, interpolation=cv2.INTER_LINEAR)
 
                 # Stack the 5 channels
@@ -313,19 +329,35 @@ def process_event(event_id, catalog, s3, debug=False):
                 # 3. ALWAYS close all datasets and delete the temp file
                 # We must close *every* dataset in the list
                 for ds in hrrr_datasets:
-                    ds.close()
+                    try:
+                        ds.close()
+                    except:
+                        pass  # Ignore errors when closing
 
+                # Try to delete the temp file, with retries if it's locked
                 if os.path.exists(temp_hrrr_file):
-                    os.remove(temp_hrrr_file)
+                    import time
+                    max_attempts = 3
+                    for attempt in range(max_attempts):
+                        try:
+                            os.remove(temp_hrrr_file)
+                            break
+                        except PermissionError:
+                            if attempt < max_attempts - 1:
+                                time.sleep(0.5)  # Wait before retry
+                            else:
+                                if debug:
+                                    print(
+                                        f"Warning: Could not delete temp file {temp_hrrr_file} after {max_attempts} attempts")
 
-        if len(event_sequence) >= 10:  # Only save if we got at least 10 valid frames
+        if len(event_sequence) > 0:  # Only save if we got at least 1 valid frames
             final_sequence = np.array(event_sequence)
             np.save(output_filepath, final_sequence)
             if debug:
                 print(f"Event {event_id}: Successfully saved {len(event_sequence)} frames to {output_filepath}")
         else:
             if debug:
-                print(f"Event {event_id}: Only got {len(event_sequence)} frames, need at least 10. Skipping.")
+                print(f"Event {event_id}: Only got {len(event_sequence)} frames, need at least 1. Skipping.")
 
     except Exception as e:
         print(f"CRITICAL Error processing event {event_id}: {e}. Skipping entire event.")
