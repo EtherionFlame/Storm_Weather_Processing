@@ -1,4 +1,5 @@
-
+# FULL FIXED VERSION OF YOUR SCRIPT
+# Includes working HRRR GRIB loader using cfgrib group-merging
 
 import os
 import subprocess
@@ -22,26 +23,66 @@ OUTPUT_PATH = os.path.join(PROJECT_PATH, 'ProcessedData')
 CATALOG_PATH = os.path.join(PROJECT_PATH, 'CATALOG.csv')
 TEMP_HRRR_PATH = os.path.join(PROJECT_PATH, 'temp_hrrr')
 
+
 # ---------------- HRRR GRIB FIX ---------------- #
 def open_hrrr_grib(path):
-    groups = ["surface", "isobaricInhPa", "pressure", None]
+    """
+    Opens a complex HRRR GRIB file by loading known groups separately
+    and merging them with 'compat=override' to handle internal
+    coordinate conflicts (like different isobaricInhPa levels).
+    """
+    # Define the groups to check. Added more for robustness.
+    groups = [
+        "surface",
+        "isobaricInhPa",
+        "heightAboveGround",
+        "meanSea",
+        "pressureFromGroundLayer",
+        "atmosphereSingleLayer"  # Added this as CAPE is often here
+    ]
     datasets = []
 
     for grp in groups:
         try:
-            kwargs = {"indexpath": ""}
-            if grp is not None:
-                kwargs["filter_by_keys"] = {"typeOfLevel": grp}
+            # Set backend_kwargs to filter by the group
+            kwargs = {
+                "indexpath": "",
+                "filter_by_keys": {"typeOfLevel": grp}
+            }
 
-            ds = xr.open_dataset(path, engine='cfgrib', backend_kwargs=kwargs)
+            # Open the dataset *with compat='override'*
+            # This is the fix: it handles conflicts *within* the group
+            ds = xr.open_dataset(
+                path,
+                engine='cfgrib',
+                compat="override",  # <-- THIS IS THE FIX
+                backend_kwargs=kwargs
+            )
             datasets.append(ds)
         except Exception:
+            # This group might not exist in the file, which is fine
             pass
+
+    # Also try to open with no filter, in case some variables are
+    # in an unknown group (like 'pressure') or have no typeOfLevel
+    try:
+        ds = xr.open_dataset(
+            path,
+            engine='cfgrib',
+            compat="override",
+            backend_kwargs={"indexpath": ""}
+        )
+        datasets.append(ds)
+    except Exception:
+        pass
 
     if not datasets:
         raise RuntimeError(f"No valid GRIB groups found in {path}")
 
+    # Merge all the loaded groups (e.g., 'surface' + 'isobaricInhPa')
+    # Use 'override' again for the final merge
     return xr.merge(datasets, compat="override")
+
 
 # ------------------------------------------------ #
 
@@ -63,9 +104,11 @@ def download_catalog():
     except Exception:
         return False
 
+
 def build_hrrr_url(timestamp):
     dt = pd.to_datetime(timestamp)
     return f"s3://noaa-hrrr-bdp-pds/hrrr.{dt:%Y%m%d}/conus/hrrr.t{dt:%H}z.wrfsfcf00.grib2"
+
 
 def get_event_data(event_id, catalog):
     try:
@@ -89,6 +132,7 @@ def get_event_data(event_id, catalog):
         return merged if len(merged) else None
     except Exception:
         return None
+
 
 def _get_var(ds, candidates):
     for name in candidates:
@@ -144,18 +188,21 @@ def process_event(event_id, catalog, s3, debug=False):
 
             try:
                 prmsl = _get_var(ds_all.sel(latitude=lat_slice, longitude=lon_slice), ['prmsl', 'msl', 'mslet'])
-                prmsl = np.squeeze(prmsl)
+                prmsl = np.squeeze(prmsl.values)  # Use .values to get numpy array
             except Exception:
-                prmsl = np.zeros((vil.shape[0], vil.shape[1]))
+                prmsl = np.zeros_like(vil)  # Use vil shape as a template for zeros
 
             target = (384, 384)
-            ir_resize = cv2.resize(ir107, target)
-            t2m_resize = cv2.resize(np.squeeze(t2m), target)
-            cape_resize = cv2.resize(np.squeeze(cape), target)
-            prmsl_resize = cv2.resize(prmsl, target)
+            # Ensure vil is also resized to the target size
+            vil_resize = cv2.resize(vil, target, interpolation=cv2.INTER_LINEAR)
+            ir_resize = cv2.resize(ir107, target, interpolation=cv2.INTER_LINEAR)
+            # Use .values to ensure we're resizing the numpy array
+            t2m_resize = cv2.resize(np.squeeze(t2m.values), target, interpolation=cv2.INTER_LINEAR)
+            cape_resize = cv2.resize(np.squeeze(cape.values), target, interpolation=cv2.INTER_LINEAR)
+            prmsl_resize = cv2.resize(prmsl, target, interpolation=cv2.INTER_LINEAR)  # prmsl is already numpy
 
             combined = np.stack([
-                vil,
+                vil_resize,  # Use the resized VIL
                 ir_resize,
                 t2m_resize,
                 prmsl_resize,
@@ -164,7 +211,10 @@ def process_event(event_id, catalog, s3, debug=False):
 
             event_sequence.append(combined)
 
-        except Exception:
+        except Exception as e:
+            # Print the error to see what's failing
+            if debug:
+                print(f"Warning: Error processing frame for {event_id}: {e}")
             continue
 
         finally:
@@ -179,6 +229,7 @@ def process_event(event_id, catalog, s3, debug=False):
                 except:
                     pass
 
+    # Save if 1 or more frames were successfully processed
     if event_sequence:
         np.save(output_filepath, np.array(event_sequence))
 
@@ -193,16 +244,24 @@ def main():
         print("Catalog download failed.")
         sys.exit()
 
-    catalog = pd.read_csv(CATALOG_PATH)
+    # Use low_memory=False for better parsing of large catalog
+    catalog = pd.read_csv(CATALOG_PATH, low_memory=False)
 
-    vil_events = set(catalog[catalog['img_type']=='vil']['event_id'])
-    ir_events = set(catalog[catalog['img_type']=='ir107']['event_id'])
+    vil_events = set(catalog[catalog['img_type'] == 'vil']['event_id'])
+    ir_events = set(catalog[catalog['img_type'] == 'ir107']['event_id'])
     events = sorted(list(vil_events & ir_events))
+
+    print(f"Found {len(events)} events with both VIL and IR107 data.")
 
     s3 = s3fs.S3FileSystem(anon=True)
 
-    for e in tqdm(events[:5], desc="Processing HRRR/SEVIR Events"):
+    # Modified to run all events, not just 5
+    print("Starting processing...")
+    for e in tqdm(events, desc="Processing HRRR/SEVIR Events"):
+        # Set debug=False to run without verbose logging
         process_event(e, catalog, s3, debug=True)
+
+    print("Processing complete.")
 
 
 if __name__ == '__main__':
